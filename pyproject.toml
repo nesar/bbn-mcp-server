@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bbn-mcp-server"
+version = "0.1.0"
+description = "MCP server exposing Big Bang Nucleosynthesis tools (PRyMordial) for the HEP-KE tutorial."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp[cli]>=1.27,<2",
+    "pydantic>=2,<3",
+    "numpy",
+    "scipy",
+    "matplotlib>=3.8",
+    # PRyMordial's recommended accelerators (PRyMordial itself is fetched
+    # from GitHub by scripts/setup_prymordial.py — it is not on PyPI):
+    "numba",
+    "numdifftools",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.mcp-server]
+tool_modules = ["tools"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mcp_server*", "tools*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
