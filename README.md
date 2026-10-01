@@ -43,14 +43,15 @@ here — a setup script fetches a pinned copy into `extern/` (gitignored).
 | tool | what it does |
 |---|---|
 | `describe_bbn_inputs()` | parameters, measured abundances, references, the classic questions — call it first |
-| `compute_abundances(omega_b_h2, delta_neff, tau_n_s)` | one full 63-reaction run: N_eff, Yp, D/H, ³He/H, ⁷Li/H, each with its pull (σ) against observation |
-| `scan_baryon_density(output_dir, ...)` | abundances vs Ω_b h² → CSV (the Schramm-plot calculation) |
-| `plot_abundance_curves(scan_file, output_dir)` | Yp, D/H, ⁷Li/H vs Ω_b h² with observed bands + the CMB baryon density |
-| `scan_neff(output_dir, ...)` | abundances vs ΔN_eff (each point re-solves the thermal history) → CSV |
-| `plot_neff_impact(scan_file, output_dir)` | how dark radiation shifts Yp and D/H — BBN as a particle counter |
-| `scan_neutron_lifetime(output_dir, ...)` | Yp and D/H vs τ_n → CSV |
-| `plot_neutron_lifetime_impact(scan_file, output_dir)` | Yp(τ_n) against the observed helium band and the discrepant bottle/beam measurements |
-| `fit_baryon_density(scan_file, observables)` | χ² fit: the BBN-preferred Ω_b h² ± 1σ, compared with Planck — the concordance test in one number |
+| `compute_bbn_abundances(omega_b_h2, delta_neff, tau_n_s)` | one full 63-reaction run: N_eff, Yp, D/H, ³He/H, ⁷Li/H, each with its pull (σ) against observation |
+| `scan_bbn_parameter(output_dir, parameter, ...)` | vary one input — `omega_b_h2` (the Schramm-plot calculation), `delta_neff` (each point re-solves the thermal history), or `tau_n_s` — with the other two held fixed → CSV (unique name per scan, so scans at different fixed values coexist) |
+| `plot_bbn_scan(scan_files, output_dir, ...)` | publication figure from one or several scans of the same parameter: Yp, D/H, ³He/H, ⁷Li/H panels with measured bands, plus the Planck Ω_b h² band, the SM N_eff line, or the bottle/beam τ_n bands as appropriate; optional PDF |
+| `fit_bbn_baryon_density(scan_file, observables)` | χ² fit on an Ω_b h² scan: the BBN-preferred Ω_b h² ± 1σ, compared with Planck — the concordance test in one number |
+
+ΔN_eff is an **input** here. The ΔN_eff a specific particle model produces
+(e.g. a sterile neutrino of given mass and mixing) comes from that model's
+own server; feed the value into these tools. Figures use matplotlib's
+built-in mathtext (STIX fonts) — no LaTeX installation is needed.
 
 Predictions carry the nuclear-rate systematic (PRIMAT compilation,
 PRyMordial's default) in quadrature with the measurement errors — the

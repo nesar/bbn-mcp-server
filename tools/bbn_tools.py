@@ -3,12 +3,18 @@
 Plain Python functions — no MCP imports. The type hints, Field constraints,
 and docstrings below become the MCP tool schema that agents see.
 
-Data flows between tools as CSV file paths: the scan_* tools write one CSV
-each, the plot_* and fit_* tools read them back. Only small numbers and file
-paths ever pass through the LLM context.
+Data flows between tools as CSV file paths: scan_bbn_parameter writes one
+CSV per scan, plot_bbn_scan and fit_bbn_baryon_density read them back. Only
+small numbers and file paths ever pass through the LLM context.
+
+Scope (shared with the sterile-neutrino server): this server takes Delta
+N_eff, Omega_b h^2 and the neutron lifetime as INPUTS and predicts the
+light-element abundances. How much Delta N_eff a particular particle model
+(e.g. a sterile neutrino) PRODUCES is computed by that model's own server.
 """
 
 import csv
+import hashlib
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -16,6 +22,8 @@ import numpy as np
 from pydantic import BaseModel, Field, validate_call
 
 from .bbn import eta10, run_bbn
+from .plotting import (CMB_BAND, LAB_BANDS, LINESTYLES, MUTED, OBS_BAND,
+                       PALETTE, rc_params, wrap)
 
 # Observational anchors, quoted everywhere predictions are compared.
 # theory_error is the nuclear-rate systematic on the PREDICTION (PRyMordial
@@ -66,10 +74,40 @@ NEUTRON_LIFETIME_S = {
                  "reference": "Yue et al., PRL 111 (2013) 222501"},
 }
 
-SCAN_BARYON_COLUMNS = ["omega_b_h2", "eta10", "Yp_BBN", "D_H_x1e5",
-                       "He3_H_x1e5", "Li7_H_x1e10"]
-SCAN_NEFF_COLUMNS = ["delta_neff", "Neff", "Yp_BBN", "D_H_x1e5", "Li7_H_x1e10"]
-SCAN_TAU_COLUMNS = ["tau_n_s", "Yp_BBN", "D_H_x1e5"]
+
+# Per-parameter scan settings. delta_neff points re-solve the thermal
+# history (~10 s each), so they get a tighter cap.
+SCAN_PARAMETERS = {
+    "omega_b_h2": {"default_range": (0.010, 0.032), "bounds": (0.005, 0.05),
+                   "max_points": 30,
+                   "label": r"$\Omega_b h^2$"},
+    "delta_neff": {"default_range": (-1.0, 2.0), "bounds": (-2.0, 3.0),
+                   "max_points": 9,
+                   "label": r"$\Delta N_{\rm eff}$"},
+    "tau_n_s": {"default_range": (866.0, 896.0), "bounds": (800.0, 1000.0),
+                "max_points": 25,
+                "label": r"$\tau_n$ [s]"},
+}
+SCAN_COLUMNS = ["omega_b_h2", "eta10", "delta_neff", "Neff", "tau_n_s",
+                "Yp_BBN", "D_H_x1e5", "He3_H_x1e5", "Li7_H_x1e10"]
+
+# observable column -> (axis label, short name)
+OBSERVABLE_AXES = {
+    "Yp_BBN": (r"$Y_p$", "Yp"),
+    "D_H_x1e5": (r"$\mathrm{D/H}\ [10^{-5}]$", "D/H"),
+    "He3_H_x1e5": (r"${}^{3}\mathrm{He/H}\ [10^{-5}]$", "He3/H"),
+    "Li7_H_x1e10": (r"${}^{7}\mathrm{Li/H}\ [10^{-10}]$", "Li7/H"),
+}
+DEFAULT_PANELS = {
+    "omega_b_h2": ["Yp_BBN", "D_H_x1e5", "He3_H_x1e5", "Li7_H_x1e10"],
+    "delta_neff": ["Yp_BBN", "D_H_x1e5"],
+    "tau_n_s": ["Yp_BBN", "D_H_x1e5"],
+}
+FIXED_SYMBOLS = {"omega_b_h2": r"$\Omega_b h^2$", "delta_neff": r"$\Delta N_{\rm eff}$",
+                 "tau_n_s": r"$\tau_n$"}
+
+ScanParameter = Literal["omega_b_h2", "delta_neff", "tau_n_s"]
+Observable = Literal["Yp_BBN", "D_H_x1e5", "He3_H_x1e5", "Li7_H_x1e10"]
 
 
 class ArtifactResult(BaseModel):
@@ -81,37 +119,46 @@ class ArtifactResult(BaseModel):
     metadata: dict[str, Any]
 
 
-def _write_csv(path: Path, source: str, columns: list[str], rows) -> None:
+def _slug(**params) -> str:
+    """Short stable hash so scans at different inputs never overwrite."""
+    blob = ",".join(f"{k}={params[k]}" for k in sorted(params))
+    return hashlib.sha1(blob.encode()).hexdigest()[:6]
+
+
+def _write_csv(path: Path, header: dict[str, str], columns: list[str], rows) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
-        f.write(f"# source: {source}\n")
+        for key, value in header.items():
+            f.write(f"# {key}: {value}\n")
         writer = csv.writer(f)
         writer.writerow(columns)
         writer.writerows(rows)
 
 
-def _read_csv(path_str: str, expected_columns: list[str]) -> tuple[str, dict[str, np.ndarray]]:
-    """Read a CSV written by _write_csv, checking it has the right columns."""
+def _read_scan(path_str: str) -> tuple[dict[str, str], dict[str, np.ndarray]]:
+    """Read a CSV written by scan_bbn_parameter: (header dict, columns)."""
     path = Path(path_str).expanduser().resolve()
     lines = path.read_text(encoding="utf-8").splitlines()
-    source = lines[0].removeprefix("# source:").strip() if lines[0].startswith("#") else path.stem
-    header = lines[1].split(",") if lines[0].startswith("#") else lines[0].split(",")
-    missing = [c for c in expected_columns if c not in header]
-    if missing:
+    header, i = {}, 0
+    while i < len(lines) and lines[i].startswith("#"):
+        key, _, value = lines[i].lstrip("# ").partition(":")
+        header[key.strip()] = value.strip()
+        i += 1
+    names = lines[i].split(",")
+    missing = [c for c in SCAN_COLUMNS if c not in names]
+    if missing or "scanned_parameter" not in header:
         raise ValueError(
-            f"{path.name} is missing columns {missing} (found {header}). "
-            "Pass a CSV produced by the matching scan_* tool."
-        )
-    data = np.loadtxt(path, delimiter=",", skiprows=2 if lines[0].startswith("#") else 1).T
-    return source, {name: col for name, col in zip(header, np.atleast_2d(data))}
+            f"{path.name} is not a scan_bbn_parameter CSV (missing columns "
+            f"{missing or 'scanned_parameter header'}). Pass a file written "
+            "by scan_bbn_parameter.")
+    data = np.loadtxt(lines[i + 1:], delimiter=",", ndmin=2).T
+    return header, {name: col for name, col in zip(names, data)}
 
 
 def _outdir(output_dir: str) -> Path:
     outdir = Path(output_dir).expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
     return outdir
-
-
 def _pulls(result: dict[str, float]) -> dict[str, dict[str, float | str]]:
     """Compare predictions with the observational anchors, in sigma."""
     comparison = {}
@@ -131,7 +178,7 @@ def _pulls(result: dict[str, float]) -> dict[str, dict[str, float | str]]:
 
 @validate_call
 def describe_bbn_inputs() -> ArtifactResult:
-    """Explain the physics inputs, observables, and stories of the BBN tools.
+    """Explain the physics inputs, observables, and workflow of the BBN tools.
 
     Use this tool first. It lists the three tunable parameters (baryon
     density, extra relativistic species, neutron lifetime), the measured
@@ -180,29 +227,39 @@ def describe_bbn_inputs() -> ArtifactResult:
             ],
             "software": "PRyMordial, Burns, Tait & Valli, EPJC 84 (2024) 86, "
                         "arXiv:2307.07061 (fetched by scripts/setup_prymordial.py)",
-            "runtime_note": "compute_abundances takes seconds; scans take up "
-                            "to ~1 minute — do not retry while one is running.",
+            "workflow": [
+                "compute_bbn_abundances: one parameter point, with pulls",
+                "scan_bbn_parameter: vary omega_b_h2, delta_neff or tau_n_s "
+                "-> CSV",
+                "plot_bbn_scan: figure from one or several scan CSVs",
+                "fit_bbn_baryon_density: BBN omega_b_h2 vs the CMB value "
+                "(needs an omega_b_h2 scan)",
+            ],
+            "scope": "Delta N_eff is an INPUT here. To get the Delta N_eff "
+                     "a specific particle model produces (e.g. a sterile "
+                     "neutrino of given mass and mixing), use that model's "
+                     "server, then feed the value to this one.",
+            "runtime_note": "compute_bbn_abundances takes seconds; scans "
+                            "take up to ~1 minute (delta_neff scans ~10 s "
+                            "per point) — do not retry while one is running.",
         },
     )
 
 
+
 @validate_call
-def compute_abundances(
-    omega_b_h2: Annotated[float, Field(ge=0.005, le=0.05)] = 0.02237,
-    delta_neff: Annotated[float, Field(ge=-2.0, le=3.0)] = 0.0,
-    tau_n_s: Annotated[float, Field(ge=800.0, le=1000.0)] = 878.4,
+def compute_bbn_abundances(
+    omega_b_h2: Annotated[float, Field(ge=0.005, le=0.05, description="Physical baryon density Omega_b h^2 (CMB: 0.02237).")] = 0.02237,
+    delta_neff: Annotated[float, Field(ge=-2.0, le=3.0, description="Extra relativistic species beyond the SM (0 = none; SM N_eff = 3.044). An INPUT here — get model-specific values from the model's own server.")] = 0.0,
+    tau_n_s: Annotated[float, Field(ge=800.0, le=1000.0, description="Neutron lifetime in seconds (PDG average: 878.4).")] = 878.4,
 ) -> ArtifactResult:
-    """Compute the primordial light-element abundances for one set of inputs.
+    """Predict the primordial light-element abundances (BBN) at one input point.
 
-    Runs the full 63-reaction PRyMordial network and returns Neff, the
+    Runs the full 63-reaction PRyMordial network and returns N_eff, the
     helium-4 mass fraction Yp, D/H, He3/H and Li7/H, each compared with the
-    measured primordial values (pull in sigma). Use scan_* tools to explore a
-    parameter range instead of calling this repeatedly.
-
-    Args:
-        omega_b_h2: Physical baryon density Omega_b h^2 (CMB: 0.02237).
-        delta_neff: Extra relativistic species beyond the SM (0 = none).
-        tau_n_s: Neutron lifetime in seconds (PDG average: 878.4).
+    measured primordial values (pull in sigma, measurement and nuclear-rate
+    errors in quadrature). To explore a range, call scan_bbn_parameter once
+    instead of calling this repeatedly.
     """
     result = run_bbn(omega_b_h2, delta_neff, tau_n_s, small_network=False)
     return ArtifactResult(
@@ -223,334 +280,240 @@ def compute_abundances(
 
 
 @validate_call
-def scan_baryon_density(
+def scan_bbn_parameter(
     output_dir: Annotated[str, Field(min_length=1)],
-    omega_b_h2_min: Annotated[float, Field(ge=0.005)] = 0.010,
-    omega_b_h2_max: Annotated[float, Field(le=0.05)] = 0.032,
-    n_points: Annotated[int, Field(ge=5, le=30)] = 12,
-    delta_neff: Annotated[float, Field(ge=-2.0, le=3.0)] = 0.0,
-    tau_n_s: Annotated[float, Field(ge=800.0, le=1000.0)] = 878.4,
+    parameter: Annotated[ScanParameter, Field(description="Which input to vary: 'omega_b_h2' (baryon density — the Schramm plot; needed by fit_bbn_baryon_density), 'delta_neff' (dark radiation; each point re-solves the thermal history, ~10 s, max 9 points), or 'tau_n_s' (neutron lifetime).")],
+    range_min: Annotated[float | None, Field(description="Lower end of the scan. Default: 0.010 (omega_b_h2), -1 (delta_neff), 866 (tau_n_s).")] = None,
+    range_max: Annotated[float | None, Field(description="Upper end. Default: 0.032 (omega_b_h2), 2 (delta_neff), 896 (tau_n_s).")] = None,
+    n_points: Annotated[int, Field(ge=3, le=30, description="Scan points (caps: 30 omega_b_h2, 9 delta_neff, 25 tau_n_s).")] = 9,
+    omega_b_h2: Annotated[float, Field(ge=0.005, le=0.05, description="Baryon density held fixed when another parameter is scanned.")] = 0.02237,
+    delta_neff: Annotated[float, Field(ge=-2.0, le=3.0, description="Delta N_eff held fixed when another parameter is scanned.")] = 0.0,
+    tau_n_s: Annotated[float, Field(ge=800.0, le=1000.0, description="Neutron lifetime held fixed when another parameter is scanned.")] = 878.4,
 ) -> ArtifactResult:
-    """Scan the baryon density and tabulate the light-element abundances.
+    """Scan one BBN input and tabulate all light-element abundances to CSV.
 
-    Writes a CSV (columns omega_b_h2, eta10, Yp_BBN, D_H_x1e5, He3_H_x1e5,
-    Li7_H_x1e10) for plot_abundance_curves and fit_baryon_density. This is
-    the calculation behind the classic 'Schramm plot'. Uses the 12-reaction
-    network (abundance shifts ~0.2% vs the full one). Takes ~10-60 seconds.
-
-    Args:
-        output_dir: Directory where the CSV is written.
-        omega_b_h2_min: Lower end of the Omega_b h^2 range.
-        omega_b_h2_max: Upper end of the Omega_b h^2 range.
-        n_points: Number of scan points.
-        delta_neff: Extra relativistic species held fixed during the scan.
-        tau_n_s: Neutron lifetime in seconds held fixed during the scan.
+    One tool for the three classic scans: baryon density (the Schramm plot
+    and the BBN baryometer), Delta N_eff (BBN as a counter of light species),
+    neutron lifetime (the bottle-vs-beam puzzle). The other two inputs are
+    held at the given fixed values, recorded in the CSV header; every scan
+    gets its own file name, so scans at different fixed values coexist and
+    overlay in plot_bbn_scan. Columns: omega_b_h2, eta10, delta_neff, Neff,
+    tau_n_s, Yp_BBN, D_H_x1e5, He3_H_x1e5, Li7_H_x1e10. Uses the 12-reaction
+    network (abundances within ~0.2% of the full one). Takes ~10-90 s.
     """
-    if omega_b_h2_min >= omega_b_h2_max:
-        raise ValueError("omega_b_h2_min must be smaller than omega_b_h2_max.")
-    grid = np.linspace(omega_b_h2_min, omega_b_h2_max, n_points)
+    spec = SCAN_PARAMETERS[parameter]
+    lo = spec["default_range"][0] if range_min is None else range_min
+    hi = spec["default_range"][1] if range_max is None else range_max
+    b_lo, b_hi = spec["bounds"]
+    if not (b_lo <= lo < hi <= b_hi):
+        raise ValueError(
+            f"{parameter} range must satisfy {b_lo:g} <= range_min < range_max "
+            f"<= {b_hi:g} (got {lo:g}..{hi:g}); range_min must be smaller "
+            "than range_max.")
+    if n_points > spec["max_points"]:
+        raise ValueError(f"{parameter} scans allow at most {spec['max_points']} "
+                         "points (each point is a full BBN run).")
+
+    fixed = {"omega_b_h2": omega_b_h2, "delta_neff": delta_neff, "tau_n_s": tau_n_s}
     rows = []
-    for ob in grid:
-        r = run_bbn(float(ob), delta_neff, tau_n_s, small_network=True)
-        rows.append((ob, eta10(float(ob)), r["Yp_BBN"], r["D_H_x1e5"],
-                     r["He3_H_x1e5"], r["Li7_H_x1e10"]))
-    csv_path = _outdir(output_dir) / "bbn_baryon_scan.csv"
-    _write_csv(csv_path,
-               f"PRyMordial baryon-density scan, dNeff={delta_neff:g}, tau_n={tau_n_s:g}s",
-               SCAN_BARYON_COLUMNS, rows)
+    for value in np.linspace(lo, hi, n_points):
+        point = dict(fixed, **{parameter: float(value)})
+        r = run_bbn(point["omega_b_h2"], point["delta_neff"], point["tau_n_s"],
+                    small_network=True)
+        rows.append((point["omega_b_h2"], eta10(point["omega_b_h2"]),
+                     point["delta_neff"], r["Neff"], point["tau_n_s"],
+                     r["Yp_BBN"], r["D_H_x1e5"], r["He3_H_x1e5"],
+                     r["Li7_H_x1e10"]))
+
+    held = {k: v for k, v in fixed.items() if k != parameter}
+    slug = _slug(parameter=parameter, lo=lo, hi=hi, n=n_points, **held)
+    csv_path = _outdir(output_dir) / f"bbn_scan_{parameter}_{slug}.csv"
+    _write_csv(csv_path, {
+        "source": "PRyMordial (12-reaction network)",
+        "scanned_parameter": parameter,
+        "fixed": ", ".join(f"{k}={v:g}" for k, v in held.items()),
+    }, SCAN_COLUMNS, rows)
+    table = np.array(rows)
+    col = {name: table[:, i] for i, name in enumerate(SCAN_COLUMNS)}
     return ArtifactResult(
         status="success",
         files=[str(csv_path)],
-        message=(
-            f"Scanned omega_b h^2 over [{omega_b_h2_min:g}, {omega_b_h2_max:g}] "
-            f"({n_points} points)."
-        ),
+        message=(f"Scanned {parameter} over [{lo:g}, {hi:g}] ({n_points} points) "
+                 f"with {', '.join(f'{k}={v:g}' for k, v in held.items())}."),
         metadata={
-            "columns": SCAN_BARYON_COLUMNS,
-            "delta_neff": delta_neff,
-            "tau_n_s": tau_n_s,
-            "cmb_omega_b_h2": CMB_OMEGA_B,
+            "scanned_parameter": parameter, "range": [lo, hi],
+            "fixed_inputs": held, "columns": SCAN_COLUMNS,
+            "endpoints": {k: [round(float(col[k][0]), 4), round(float(col[k][-1]), 4)]
+                          for k in ("Yp_BBN", "D_H_x1e5", "Li7_H_x1e10", "Neff")},
+            "next": ("plot_bbn_scan for the figure"
+                     + ("; fit_bbn_baryon_density for the BBN baryon density"
+                        if parameter == "omega_b_h2" else "")),
         },
     )
 
 
+def _scan_label(header: dict, varying: set[str]) -> str:
+    """Legend entry: the fixed inputs that differ between overlaid scans."""
+    fixed = dict(item.split("=") for item in header.get("fixed", "").split(", ") if "=" in item)
+    parts = [f"{FIXED_SYMBOLS[k]} = {float(fixed[k]):g}" for k in sorted(varying) if k in fixed]
+    return ", ".join(parts) or "BBN prediction"
+
+
 @validate_call
-def plot_abundance_curves(
-    scan_file: Annotated[str, Field(min_length=1)],
+def plot_bbn_scan(
+    scan_files: Annotated[list[str], Field(min_length=1, max_length=6, description="CSV(s) from scan_bbn_parameter, all scanning the SAME parameter (e.g. omega_b_h2 scans at delta_neff = 0 and 1 overlay as separate curves).")],
     output_dir: Annotated[str, Field(min_length=1)],
+    observables: Annotated[list[Observable] | None, Field(description="Panels to draw, top to bottom. Default: Yp, D/H, He3/H, Li7/H for omega_b_h2 scans; Yp and D/H otherwise.")] = None,
+    labels: Annotated[list[str] | None, Field(description="Short legend entry per scan file. Default: the fixed inputs that differ between files.")] = None,
+    title: Annotated[str | None, Field(description="Optional title (wrapped). Leave unset for a paper-ready figure.")] = None,
+    save_pdf: Annotated[bool, Field(description="Also write a vector PDF next to the PNG (for manuscripts).")] = False,
+    output_name: Annotated[str | None, Field(description="Optional output file stem.")] = None,
 ) -> ArtifactResult:
-    """Draw the Schramm plot: abundances vs baryon density, data over theory.
+    """Plot BBN abundance predictions from scan CSVs against the measured values.
 
-    Use this tool after scan_baryon_density. Three stacked panels — Yp, D/H,
-    Li7/H — as functions of Omega_b h^2, each with its measured primordial
-    band, plus the CMB baryon density as a vertical band. Where the curves
-    cross the bands is the BBN determination of the baryon density; the Li7
-    panel shows the lithium problem.
-
-    Args:
-        scan_file: CSV written by scan_baryon_density.
-        output_dir: Directory where the PNG is written.
+    Decorations follow the scanned parameter:
+    - omega_b_h2: the Schramm plot — stacked panels vs Omega_b h^2 with the
+      measured primordial bands and the Planck CMB baryon density; the top
+      axis shows eta_10. The Li7/H panel shows the lithium problem.
+    - delta_neff: Yp and D/H vs Delta N_eff with measured bands and the SM
+      point marked; the top axis shows N_eff.
+    - tau_n_s: Yp and D/H vs the neutron lifetime with the bottle and beam
+      laboratory measurements as vertical bands.
+    Measured bands include the nuclear-rate theory error in quadrature (as
+    in the pulls). Journal-style mathtext, no LaTeX install needed.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
 
-    _, d = _read_csv(scan_file, SCAN_BARYON_COLUMNS)
-    fig, axes = plt.subplots(3, 1, figsize=(7.5, 10), sharex=True,
-                             gridspec_kw={"hspace": 0.08})
-    panels = [
-        ("Yp_BBN", r"$Y_p$", "linear"),
-        ("D_H_x1e5", r"$10^5\,\mathrm{D/H}$", "linear"),
-        ("Li7_H_x1e10", r"$10^{10}\,{}^7\mathrm{Li/H}$", "linear"),
-    ]
-    for ax, (col, label, yscale) in zip(axes, panels):
-        ax.plot(d["omega_b_h2"], d[col], color="C0", linewidth=2,
-                label="BBN prediction (PRyMordial)")
-        obs = OBSERVATIONS[col]
-        err = _total_error(obs)
-        ax.axhspan(obs["value"] - err, obs["value"] + err,
-                   color="C2", alpha=0.35,
-                   label="observed (incl. rate syst.)")
-        ax.axvspan(CMB_OMEGA_B["value"] - CMB_OMEGA_B["error"],
-                   CMB_OMEGA_B["value"] + CMB_OMEGA_B["error"],
-                   color="C3", alpha=0.5,
-                   label=r"CMB $\Omega_b h^2$ (Planck)")
-        ax.set_ylabel(label)
-        ax.set_yscale(yscale)
-    axes[0].set_title("Primordial abundances vs baryon density")
-    axes[0].legend(fontsize="small", loc="lower right")
-    axes[-1].set_xlabel(r"$\Omega_b h^2$")
+    scans = [_read_scan(f) for f in scan_files]
+    params = {h["scanned_parameter"] for h, _ in scans}
+    if len(params) > 1:
+        raise ValueError(f"All scan_files must scan the same parameter (got "
+                         f"{sorted(params)}); plot them in separate calls.")
+    parameter = params.pop()
+    panels = list(observables or DEFAULT_PANELS[parameter])
+    if labels is not None and len(labels) != len(scans):
+        raise ValueError(f"labels has {len(labels)} entries for {len(scans)} files.")
+    fixed_sets = [h.get("fixed", "") for h, _ in scans]
+    varying = set()
+    if len(scans) > 1:
+        parsed = [dict(i.split("=") for i in f.split(", ") if "=" in i) for f in fixed_sets]
+        varying = {k for k in parsed[0] if len({p.get(k) for p in parsed}) > 1}
+    legend_labels = labels or [_scan_label(h, varying) for h, _ in scans]
+    if len(scans) == 1 and labels is None:
+        legend_labels = ["BBN prediction (PRyMordial)"]
 
-    secax = axes[0].secondary_xaxis(
-        "top",
-        functions=(lambda ob: eta10(1.0) * ob, lambda e: e / eta10(1.0)),
-    )
-    secax.set_xlabel(r"$\eta_{10}$ (baryon-to-photon ratio $\times 10^{10}$)")
+    with plt.rc_context(rc_params()):
+        height = 1.9 + 2.0 * len(panels)
+        fig, axes = plt.subplots(len(panels), 1, figsize=(6.4, height),
+                                 sharex=True, layout="constrained",
+                                 squeeze=False)
+        axes = axes[:, 0]
+        for ax, obs_key in zip(axes, panels):
+            for i, (_, d) in enumerate(scans):
+                ax.plot(d[parameter], d[obs_key], color=PALETTE[i],
+                        linestyle=LINESTYLES[i], label=legend_labels[i],
+                        marker="o" if parameter == "delta_neff" else None,
+                        markersize=4, zorder=3)
+            if obs_key in OBSERVATIONS:
+                obs = OBSERVATIONS[obs_key]
+                err = _total_error(obs)
+                ax.axhspan(obs["value"] - err, obs["value"] + err,
+                           color=OBS_BAND, alpha=0.35, linewidth=0, zorder=1,
+                           label="measured primordial value")
+            if parameter == "omega_b_h2":
+                ax.axvspan(CMB_OMEGA_B["value"] - CMB_OMEGA_B["error"],
+                           CMB_OMEGA_B["value"] + CMB_OMEGA_B["error"],
+                           color=CMB_BAND, alpha=0.3, linewidth=0, zorder=2,
+                           label=r"Planck CMB $\Omega_b h^2$")
+            elif parameter == "delta_neff":
+                ax.axvline(0.0, color=MUTED, linewidth=0.9, linestyle=":",
+                           zorder=2, label=r"Standard Model ($N_{\rm eff}=3.044$)")
+            else:
+                for j, key in enumerate(("bottle_ucn_tau", "beam_bl1")):
+                    m = NEUTRON_LIFETIME_S[key]
+                    ax.axvspan(m["value"] - m["error"], m["value"] + m["error"],
+                               color=LAB_BANDS[j], alpha=0.3, linewidth=0, zorder=2,
+                               label=rf"{key.split('_')[0]}: $\tau_n = {m['value']:g} \pm {m['error']:g}$ s")
+            values = np.concatenate([d[obs_key] for _, d in scans])
+            if values.min() > 0 and values.max() / values.min() > 3:
+                ax.set_yscale("log")   # Schramm-plot convention for wide spans
+                ax.yaxis.set_major_locator(LogLocator(subs=(1.0, 2.0, 5.0)))
+                ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+                ax.yaxis.set_minor_formatter(NullFormatter())
+            ax.set_ylabel(OBSERVABLE_AXES[obs_key][0])
+        axes[-1].set_xlabel(SCAN_PARAMETERS[parameter]["label"])
 
-    plot_path = _outdir(output_dir) / "bbn_abundance_curves.png"
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+        d0 = scans[0][1]
+        if parameter == "omega_b_h2":
+            k = eta10(1.0)
+            top = axes[0].secondary_xaxis("top", functions=(lambda ob: k * ob,
+                                                            lambda e: e / k))
+            top.set_xlabel(r"$\eta_{10}$")
+        elif parameter == "delta_neff":
+            offset = float(np.mean(d0["Neff"] - d0["delta_neff"]))
+            top = axes[0].secondary_xaxis("top", functions=(lambda x: x + offset,
+                                                            lambda n: n - offset))
+            top.set_xlabel(r"$N_{\rm eff}$")
+        if parameter in ("omega_b_h2", "delta_neff"):
+            top.tick_params(which="both", direction="in")
+        if title:
+            fig.suptitle(wrap(title, 60), x=0.02, ha="left")
+
+        handles, names = [], []
+        for ax in axes:
+            for h, n in zip(*ax.get_legend_handles_labels()):
+                if n not in names:
+                    handles.append(h)
+                    names.append(n)
+        fig.legend(handles, [wrap(n, 44) for n in names],
+                   loc="outside lower center", ncol=2, borderaxespad=0.3)
+
+        stem = output_name or f"bbn_{parameter}_{_slug(f=tuple(scan_files), o=tuple(panels))}"
+        out = _outdir(output_dir)
+        plot_path = out / f"{stem}.png"
+        fig.savefig(plot_path, bbox_inches="tight", pad_inches=0.08, facecolor="white")
+        files = [str(plot_path)]
+        if save_pdf:
+            fig.savefig(plot_path.with_suffix(".pdf"), bbox_inches="tight", pad_inches=0.08)
+            files.append(str(plot_path.with_suffix(".pdf")))
+        plt.close(fig)
+
+    meta = {"scanned_parameter": parameter, "panels": panels,
+            "legend_labels": legend_labels,
+            "observed_bands": {k: OBSERVATIONS[k] for k in panels if k in OBSERVATIONS}}
+    if parameter == "omega_b_h2":
+        meta["cmb_band"] = CMB_OMEGA_B
+    if parameter == "tau_n_s":
+        meta["laboratory_measurements"] = NEUTRON_LIFETIME_S
     return ArtifactResult(
-        status="success",
-        files=[str(plot_path)],
-        message="Plotted Yp, D/H and Li7/H vs baryon density with observed bands.",
-        metadata={
-            "observed_bands": {k: OBSERVATIONS[k] for k, _, _ in panels},
-            "cmb_band": CMB_OMEGA_B,
-        },
-    )
+        status="success", files=files,
+        message=f"Plotted {', '.join(OBSERVABLE_AXES[p][1] for p in panels)} vs "
+                f"{parameter} for {len(scans)} scan(s) with measured bands.",
+        metadata=meta)
 
 
 @validate_call
-def scan_neff(
-    output_dir: Annotated[str, Field(min_length=1)],
-    delta_neff_min: Annotated[float, Field(ge=-2.0)] = -1.0,
-    delta_neff_max: Annotated[float, Field(le=3.0)] = 2.0,
-    n_points: Annotated[int, Field(ge=3, le=9)] = 5,
-    omega_b_h2: Annotated[float, Field(ge=0.005, le=0.05)] = 0.02237,
-    tau_n_s: Annotated[float, Field(ge=800.0, le=1000.0)] = 878.4,
-) -> ArtifactResult:
-    """Scan extra relativistic species (dark radiation) and tabulate abundances.
-
-    Writes a CSV (columns delta_neff, Neff, Yp_BBN, D_H_x1e5, Li7_H_x1e10)
-    for plot_neff_impact. Each point re-solves the full thermal history —
-    neutrino decoupling and expansion rate change with delta_neff — so this
-    takes ~10 seconds per point. Keep n_points small.
-
-    Args:
-        output_dir: Directory where the CSV is written.
-        delta_neff_min: Lower end of the extra-species range (must be > -3).
-        delta_neff_max: Upper end of the range.
-        n_points: Number of scan points (each is a full recomputation).
-        omega_b_h2: Baryon density held fixed during the scan.
-        tau_n_s: Neutron lifetime in seconds held fixed during the scan.
-    """
-    if delta_neff_min >= delta_neff_max:
-        raise ValueError("delta_neff_min must be smaller than delta_neff_max.")
-    grid = np.linspace(delta_neff_min, delta_neff_max, n_points)
-    rows = []
-    for dn in grid:
-        r = run_bbn(omega_b_h2, float(dn), tau_n_s, small_network=True)
-        rows.append((dn, r["Neff"], r["Yp_BBN"], r["D_H_x1e5"], r["Li7_H_x1e10"]))
-    csv_path = _outdir(output_dir) / "bbn_neff_scan.csv"
-    _write_csv(csv_path,
-               f"PRyMordial dNeff scan, omega_b_h2={omega_b_h2:g}, tau_n={tau_n_s:g}s",
-               SCAN_NEFF_COLUMNS, rows)
-    return ArtifactResult(
-        status="success",
-        files=[str(csv_path)],
-        message=(
-            f"Scanned delta_neff over [{delta_neff_min:g}, {delta_neff_max:g}] "
-            f"({n_points} points)."
-        ),
-        metadata={"columns": SCAN_NEFF_COLUMNS, "omega_b_h2": omega_b_h2,
-                  "tau_n_s": tau_n_s, "sm_neff": 3.044},
-    )
-
-
-@validate_call
-def plot_neff_impact(
-    scan_file: Annotated[str, Field(min_length=1)],
-    output_dir: Annotated[str, Field(min_length=1)],
-) -> ArtifactResult:
-    """Plot how extra relativistic species shift helium and deuterium.
-
-    Use this tool after scan_neff. Two stacked panels: Yp and D/H vs
-    delta_neff, each with the measured primordial band — where the prediction
-    exits a band, that amount of dark radiation is excluded. This is how BBN
-    counts the light degrees of freedom of the universe at t ~ 1 s.
-
-    Args:
-        scan_file: CSV written by scan_neff.
-        output_dir: Directory where the PNG is written.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    _, d = _read_csv(scan_file, SCAN_NEFF_COLUMNS)
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7.5, 8), sharex=True,
-                                   gridspec_kw={"hspace": 0.08})
-    for ax, col, label in ((ax1, "Yp_BBN", r"$Y_p$"),
-                           (ax2, "D_H_x1e5", r"$10^5\,\mathrm{D/H}$")):
-        ax.plot(d["delta_neff"], d[col], color="C0", linewidth=2, marker="o",
-                label="BBN prediction")
-        obs = OBSERVATIONS[col if col in OBSERVATIONS else "Yp_BBN"]
-        err = _total_error(obs)
-        ax.axhspan(obs["value"] - err, obs["value"] + err,
-                   color="C2", alpha=0.35,
-                   label="observed (incl. rate syst.)")
-        ax.axvline(0.0, color="black", linewidth=1, linestyle=":")
-        ax.set_ylabel(label)
-        ax.legend(fontsize="small")
-    ax1.set_title("Dark radiation and the first-minutes expansion rate")
-    ax2.set_xlabel(r"$\Delta N_{\rm eff}$ (extra relativistic species)")
-
-    plot_path = _outdir(output_dir) / "bbn_neff_impact.png"
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return ArtifactResult(
-        status="success",
-        files=[str(plot_path)],
-        message="Plotted Yp and D/H vs delta_neff with observed bands.",
-        metadata={"sm_point": "delta_neff = 0 (Neff = 3.044)"},
-    )
-
-
-@validate_call
-def scan_neutron_lifetime(
-    output_dir: Annotated[str, Field(min_length=1)],
-    tau_n_min_s: Annotated[float, Field(ge=800.0)] = 866.0,
-    tau_n_max_s: Annotated[float, Field(le=1000.0)] = 896.0,
-    n_points: Annotated[int, Field(ge=5, le=25)] = 11,
-    omega_b_h2: Annotated[float, Field(ge=0.005, le=0.05)] = 0.02237,
-) -> ArtifactResult:
-    """Scan the neutron lifetime and tabulate helium-4 and deuterium.
-
-    Writes a CSV (columns tau_n_s, Yp_BBN, D_H_x1e5) for
-    plot_neutron_lifetime_impact. The neutron lifetime sets the n/p ratio
-    at weak freeze-out and is the dominant nuclear-physics uncertainty on
-    Yp — and its laboratory measurements currently disagree (bottle vs beam).
-
-    Args:
-        output_dir: Directory where the CSV is written.
-        tau_n_min_s: Lower end of the lifetime range in seconds.
-        tau_n_max_s: Upper end of the lifetime range in seconds.
-        n_points: Number of scan points.
-        omega_b_h2: Baryon density held fixed during the scan.
-    """
-    if tau_n_min_s >= tau_n_max_s:
-        raise ValueError("tau_n_min_s must be smaller than tau_n_max_s.")
-    grid = np.linspace(tau_n_min_s, tau_n_max_s, n_points)
-    rows = []
-    for tau in grid:
-        r = run_bbn(omega_b_h2, 0.0, float(tau), small_network=True)
-        rows.append((tau, r["Yp_BBN"], r["D_H_x1e5"]))
-    csv_path = _outdir(output_dir) / "bbn_tau_n_scan.csv"
-    _write_csv(csv_path,
-               f"PRyMordial neutron-lifetime scan, omega_b_h2={omega_b_h2:g}",
-               SCAN_TAU_COLUMNS, rows)
-    return ArtifactResult(
-        status="success",
-        files=[str(csv_path)],
-        message=(
-            f"Scanned tau_n over [{tau_n_min_s:g}, {tau_n_max_s:g}] s "
-            f"({n_points} points)."
-        ),
-        metadata={"columns": SCAN_TAU_COLUMNS,
-                  "laboratory_measurements": NEUTRON_LIFETIME_S},
-    )
-
-
-@validate_call
-def plot_neutron_lifetime_impact(
-    scan_file: Annotated[str, Field(min_length=1)],
-    output_dir: Annotated[str, Field(min_length=1)],
-) -> ArtifactResult:
-    """Plot primordial helium vs neutron lifetime, with bottle and beam bands.
-
-    Use this tool after scan_neutron_lifetime. Shows Yp(tau_n) crossing the
-    observed helium band, with the discrepant bottle and beam laboratory
-    measurements marked — a cosmological angle on a live particle-physics
-    puzzle.
-
-    Args:
-        scan_file: CSV written by scan_neutron_lifetime.
-        output_dir: Directory where the PNG is written.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    _, d = _read_csv(scan_file, SCAN_TAU_COLUMNS)
-    fig, ax = plt.subplots(figsize=(8, 5.5))
-    ax.plot(d["tau_n_s"], d["Yp_BBN"], color="C0", linewidth=2,
-            label=r"BBN prediction $Y_p(\tau_n)$")
-    obs = OBSERVATIONS["Yp_BBN"]
-    ax.axhspan(obs["value"] - obs["error"], obs["value"] + obs["error"],
-               color="C2", alpha=0.35, label="observed primordial helium")
-    for key, style in (("bottle_ucn_tau", "C3"), ("beam_bl1", "C1")):
-        m = NEUTRON_LIFETIME_S[key]
-        ax.axvspan(m["value"] - m["error"], m["value"] + m["error"],
-                   color=style, alpha=0.4,
-                   label=f"{key.split('_')[0]} experiment: "
-                         rf"$\tau_n = {m['value']:g} \pm {m['error']:g}$ s")
-    ax.set_xlabel(r"$\tau_n$ [s]")
-    ax.set_ylabel(r"$Y_p$")
-    ax.set_title("The neutron-lifetime puzzle seen from the early universe")
-    ax.legend(fontsize="small")
-
-    plot_path = _outdir(output_dir) / "bbn_tau_n_impact.png"
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return ArtifactResult(
-        status="success",
-        files=[str(plot_path)],
-        message="Plotted Yp vs tau_n with observed helium and lab measurement bands.",
-        metadata={"laboratory_measurements": NEUTRON_LIFETIME_S},
-    )
-
-
-@validate_call
-def fit_baryon_density(
-    scan_file: Annotated[str, Field(min_length=1)],
+def fit_bbn_baryon_density(
+    scan_file: Annotated[str, Field(min_length=1, description="CSV from scan_bbn_parameter with parameter='omega_b_h2'; the range must bracket the minimum (e.g. 0.010-0.032).")],
     observables: Annotated[list[Literal["D_H_x1e5", "Yp_BBN"]],
-                           Field(min_length=1)] = ["D_H_x1e5", "Yp_BBN"],
+                           Field(min_length=1, description="Measured abundances in the chi^2: deuterium is the precision baryometer; helium is a weak cross-check.")] = ["D_H_x1e5", "Yp_BBN"],
 ) -> ArtifactResult:
-    """Determine the baryon density preferred by the primordial abundances.
+    """Fit the baryon density preferred by BBN abundances and compare with the CMB.
 
-    Use this tool after scan_baryon_density. Builds chi^2(Omega_b h^2)
-    against the chosen measured abundances (deuterium is the precision
-    baryometer; helium adds a weak cross-check), reports the best-fit value
-    with its 1-sigma interval, and compares it with the CMB measurement —
-    the BBN/CMB concordance test in one number.
-
-    Args:
-        scan_file: CSV written by scan_baryon_density (make sure the scan
-            range brackets the minimum, e.g. 0.010-0.032).
-        observables: Which measured abundances to include in the fit.
+    Builds chi^2(Omega_b h^2) from an omega_b_h2 scan against the chosen
+    measured abundances (measurement and nuclear-rate errors in quadrature),
+    reports the best fit with its 1-sigma interval, and its tension with the
+    Planck value — the BBN/CMB concordance test in one number. The fit holds
+    delta_neff and tau_n_s at the values the scan was run with (in metadata).
     """
-    _, d = _read_csv(scan_file, SCAN_BARYON_COLUMNS)
+    header, d = _read_scan(scan_file)
+    if header["scanned_parameter"] != "omega_b_h2":
+        raise ValueError(
+            f"{Path(scan_file).name} scans {header['scanned_parameter']}; the "
+            "fit needs scan_bbn_parameter(parameter='omega_b_h2').")
     ob_grid = d["omega_b_h2"]
     fine = np.linspace(ob_grid.min(), ob_grid.max(), 2000)
     chi2 = np.zeros_like(fine)
@@ -563,8 +526,7 @@ def fit_baryon_density(
     if i_best in (0, len(fine) - 1):
         raise ValueError(
             "The chi^2 minimum sits at the edge of the scanned range — "
-            "re-run scan_baryon_density with a wider omega_b_h2 range."
-        )
+            "re-run scan_bbn_parameter(parameter='omega_b_h2') over a wider range.")
     best = float(fine[i_best])
     within = fine[chi2 <= chi2[i_best] + 1.0]
     err_low, err_high = best - float(within.min()), float(within.max()) - best
@@ -588,6 +550,7 @@ def fit_baryon_density(
             "eta10_best": round(eta10(best), 3),
             "chi2_min": round(float(chi2[i_best]), 3),
             "observables_used": list(observables),
+            "held_fixed": header.get("fixed", ""),
             "cmb_measurement": cmb,
             "tension_sigma": round(float(tension), 2),
             "note": (
